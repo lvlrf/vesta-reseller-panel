@@ -1,4 +1,5 @@
-pythonfrom typing import Optional, Dict, Any
+# backend/app/services/auth_service.py (بهبود یافته)
+from typing import Optional, Dict, Any
 from datetime import datetime
 import re
 
@@ -7,16 +8,18 @@ from fastapi import HTTPException, status
 
 from app.core.security import get_password_hash, verify_password, generate_id
 from app.core.utils import validate_mobile, format_mobile
+from app.core.exceptions import VestaException
 from app.models.user import User, UserRole
 from app.models.agent import Agent
 from app.models.credit import Credit
 from app.models.activity_log import ActivityLog
 from app.schemas.user import UserCreate, UserUpdate
-
+from app.services.otp_service import OTPService
 
 class AuthService:
     def __init__(self, db: Session):
         self.db = db
+        self.otp_service = OTPService()
     
     def get_user_by_id(self, user_id: str) -> Optional[User]:
         return self.db.query(User).filter(User.id == user_id).first()
@@ -45,10 +48,16 @@ class AuthService:
             user = self.get_user_by_username(username)
         
         if not user:
-            return None
+            raise VestaException("کاربر یافت نشد", 404)
+        
+        if not user.hashed_password:
+            raise VestaException("رمز عبور تنظیم نشده است", 400)
         
         if not verify_password(password, user.hashed_password):
-            return None
+            raise VestaException("رمز عبور اشتباه است", 401)
+        
+        if not user.is_active:
+            raise VestaException("حساب کاربری غیرفعال است", 403)
         
         # Update last login time
         user.last_login = datetime.now()
@@ -61,16 +70,79 @@ class AuthService:
         
         return user
     
+    def request_otp(self, mobile: str) -> bool:
+        """Request OTP for login"""
+        # Format and validate mobile
+        mobile = format_mobile(mobile)
+        if not mobile:
+            raise VestaException("شماره موبایل نامعتبر است", 400)
+        
+        # Generate OTP
+        from app.core.security import generate_otp
+        otp = generate_otp()
+        
+        # Save OTP
+        success = self.otp_service.save_otp(mobile, otp)
+        if not success:
+            raise VestaException("خطا در ذخیره کد تأیید", 500)
+        
+        # Get or create user
+        user = self.get_user_by_mobile(mobile)
+        if not user:
+            # Create a new user with minimal info
+            try:
+                user_in = UserCreate(
+                    mobile=mobile,
+                    first_name="کاربر",
+                    last_name="جدید",
+                    role=UserRole.AGENT
+                )
+                user = self.create_user(user_in)
+            except Exception as e:
+                raise VestaException(f"خطا در ایجاد کاربر: {str(e)}", 500)
+        
+        return True
+    
+    def verify_otp(self, mobile: str, otp: str) -> Optional[User]:
+        """Verify OTP for login"""
+        # Format mobile
+        mobile = format_mobile(mobile)
+        if not mobile:
+            raise VestaException("شماره موبایل نامعتبر است", 400)
+        
+        # Verify OTP
+        if not self.otp_service.verify_otp(mobile, otp):
+            raise VestaException("کد تأیید اشتباه یا منقضی شده است", 401)
+        
+        # Get user
+        user = self.get_user_by_mobile(mobile)
+        if not user:
+            raise VestaException("کاربر یافت نشد", 404)
+        
+        if not user.is_active:
+            raise VestaException("حساب کاربری غیرفعال است", 403)
+        
+        # Update last login time
+        user.last_login = datetime.now()
+        self.db.commit()
+        
+        # Log activity
+        self._log_activity(user.id, "login", "user", user.id, {
+            "method": "otp"
+        })
+        
+        return user
+    
     def create_user(self, user_in: UserCreate) -> User:
         # Format and validate mobile
         mobile = format_mobile(user_in.mobile)
         if not mobile:
-            raise ValueError("Invalid mobile number")
+            raise VestaException("شماره موبایل نامعتبر است", 400)
         
         # Check if mobile already exists
         existing_user = self.get_user_by_mobile(mobile)
         if existing_user:
-            raise ValueError("User with this mobile already exists")
+            raise VestaException("کاربری با این شماره موبایل وجود دارد", 400)
         
         # Generate a unique ID
         user_id = generate_id("USR")
@@ -109,107 +181,7 @@ class AuthService:
         
         # Log activity
         self._log_activity(user.id, "create", "user", user.id, {
-            "role": user.role
-        })
-        
-        return user
-    
-    def update_user(self, user_id: str, user_in: UserUpdate) -> Optional[User]:
-        user = self.get_user_by_id(user_id)
-        if not user:
-            return None
-        
-        # Format and validate mobile if changed
-        if user_in.mobile and user_in.mobile != user.mobile:
-            mobile = format_mobile(user_in.mobile)
-            if not mobile:
-                raise ValueError("Invalid mobile number")
-            
-            # Check if mobile already exists
-            existing_user = self.get_user_by_mobile(mobile)
-            if existing_user and existing_user.id != user_id:
-                raise ValueError("User with this mobile already exists")
-            
-            user_in.mobile = mobile
-        
-        # Update user fields
-        update_data = user_in.dict(exclude_unset=True)
-        
-        # Hash new password if provided
-        if "password" in update_data and update_data["password"]:
-            update_data["hashed_password"] = get_password_hash(update_data.pop("password"))
-        
-        for field, value in update_data.items():
-            setattr(user, field, value)
-        
-        self.db.commit()
-        self.db.refresh(user)
-        
-        # Log activity
-        self._log_activity(user.id, "update", "user", user.id, {})
-        
-        return user
-    
-    def save_otp(self, mobile: str, otp: str) -> bool:
-        """
-        Save OTP for a user. In a real implementation, this would use Redis or similar.
-        For now, we'll just use a temporary placeholder.
-        """
-        # Format mobile
-        mobile = format_mobile(mobile)
-        if not mobile:
-            return False
-        
-        # Get or create user
-        user = self.get_user_by_mobile(mobile)
-        if not user:
-            # Create a new user with minimal info
-            try:
-                user_in = UserCreate(
-                    mobile=mobile,
-                    first_name="New",
-                    last_name="User",
-                    role=UserRole.AGENT
-                )
-                user = self.create_user(user_in)
-            except Exception as e:
-                print(f"Error creating user: {e}")
-                return False
-        
-        # In a real implementation, store OTP in Redis with expiry
-        # For now, we'll just use a placeholder (this is not secure for production!)
-        # Use a secure database or Redis in production
-        user.hashed_password = get_password_hash(otp)
-        self.db.commit()
-        
-        return True
-    
-    def verify_otp(self, mobile: str, otp: str) -> Optional[User]:
-        """
-        Verify OTP for a user.
-        """
-        # Format mobile
-        mobile = format_mobile(mobile)
-        if not mobile:
-            return None
-        
-        # Get user
-        user = self.get_user_by_mobile(mobile)
-        if not user:
-            return None
-        
-        # Verify OTP (in a real implementation, this would check Redis)
-        # For now, we'll just check against the user's password
-        if not verify_password(otp, user.hashed_password):
-            return None
-        
-        # Update last login time
-        user.last_login = datetime.now()
-        self.db.commit()
-        
-        # Log activity
-        self._log_activity(user.id, "login", "user", user.id, {
-            "method": "otp"
+            "role": user.role.value
         })
         
         return user
